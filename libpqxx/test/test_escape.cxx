@@ -1,0 +1,269 @@
+#include <pqxx/nontransaction>
+#include <pqxx/transaction>
+
+#include "helpers.hxx"
+
+namespace
+{
+using namespace std::literals;
+using pqxx::operator""_zv;
+
+void compare_esc(
+  pqxx::connection const &cx, pqxx::transaction_base &t, char const text[])
+{
+  std::size_t const len{std::size(std::string{text})};
+  PQXX_CHECK_EQUAL(
+    cx.esc(std::string_view{text, len}), t.esc(std::string_view{text, len}));
+
+  PQXX_CHECK_EQUAL(t.esc(std::string_view{text, len}), t.esc(text));
+
+  PQXX_CHECK_EQUAL(t.esc(std::string{text}), t.esc(text));
+
+  PQXX_CHECK_EQUAL(
+    text, t.query_value<std::string>(
+            "SELECT '" + t.esc(std::string_view{text, len}) + "'"));
+
+  PQXX_CHECK_EQUAL(t.esc(std::string_view{text, len}), t.esc(text));
+}
+
+
+void test_esc(pqxx::connection const &cx, pqxx::transaction_base &t)
+{
+  PQXX_CHECK_EQUAL(t.esc(""sv), "");
+  PQXX_CHECK_EQUAL(t.esc("'"sv), "''");
+  PQXX_CHECK_EQUAL(t.esc("hello"sv), "hello");
+  std::array<char const *, 4> const escstrings{"x", " ", "", nullptr};
+  for (std::size_t i{0}; escstrings.at(i) != nullptr; ++i)
+    compare_esc(cx, t, escstrings.at(i));
+}
+
+
+void test_quote(pqxx::connection const &cx, pqxx::transaction_base &t)
+{
+  PQXX_CHECK_EQUAL(t.quote("x"), "'x'");
+  PQXX_CHECK_EQUAL(t.quote(1), "'1'");
+  PQXX_CHECK_EQUAL(t.quote(0), "'0'");
+  char const *const null_ptr{nullptr};
+  PQXX_CHECK_EQUAL(t.quote(null_ptr), "NULL");
+  PQXX_CHECK_EQUAL(t.quote(nullptr), "NULL");
+  PQXX_CHECK_EQUAL(t.quote(std::string{"'"}), "''''");
+
+  PQXX_CHECK_EQUAL(t.quote("x"), cx.quote("x"));
+
+  std::array<char const *, 10> const test_strings{
+    "", "x", "\\", "\\\\", "'", "''", "\\'", "\t", "\n", nullptr};
+
+  for (std::size_t i{0}; test_strings.at(i) != nullptr; ++i)
+  {
+    auto const r{
+      t.query_value<std::string>("SELECT " + t.quote(test_strings.at(i)))};
+    PQXX_CHECK_EQUAL(r, test_strings.at(i));
+  }
+
+  std::vector<std::byte> const bin{std::byte{0x33}, std::byte{0x4a}};
+  PQXX_CHECK_EQUAL(t.quote(bin), "'\\x334a'::bytea");
+  PQXX_CHECK_EQUAL(
+    t.quote(std::span<std::byte const>{bin}), "'\\x334a'::bytea");
+}
+
+
+void test_quote_name(pqxx::transaction_base &t)
+{
+  PQXX_CHECK_EQUAL("\"A b\"", t.quote_name("A b"));
+  PQXX_CHECK_EQUAL(
+    std::string{"A b"},
+    t.exec("SELECT 1 AS " + t.quote_name("A b")).column_name(0));
+}
+
+
+void test_esc_raw_unesc_raw(pqxx::transaction_base &t)
+{
+  constexpr char binary[]{"1\002.3\\4x5"};
+
+  // C++23: Initialise as data{std::from_range_t, binary)?
+  pqxx::bytes data;
+  for (char c : binary) data.push_back(static_cast<std::byte>(c));
+
+  std::string const escaped{
+    t.esc(pqxx::bytes_view{std::data(data), std::size(binary)})};
+
+  // All escaped characters are in a reasonable ASCII range.
+  for (auto const i : escaped)
+    PQXX_CHECK_BOUNDS(
+      static_cast<unsigned>(static_cast<unsigned char>(i)), 8u, 128u);
+
+  for (auto const i : escaped) PQXX_CHECK(isprint(i));
+
+  PQXX_CHECK_EQUAL(escaped, "\\x31022e335c34783500");
+  PQXX_CHECK_EQUAL(std::size(t.unesc_bin(escaped)), std::size(data));
+  auto unescaped{t.unesc_bin(escaped)};
+  PQXX_CHECK_EQUAL(std::size(unescaped), std::size(data));
+  for (std::size_t i{0}; i < std::size(unescaped); ++i)
+    PQXX_CHECK_EQUAL(int(unescaped[i]), int(data[i]));
+
+  PQXX_CHECK_THROWS(std::ignore = t.unesc_bin("\\"_zv), pqxx::failure);
+  PQXX_CHECK_THROWS(std::ignore = t.unesc_bin("\\xa"_zv), pqxx::failure);
+  PQXX_CHECK_THROWS(std::ignore = t.unesc_bin("\\xg0"_zv), pqxx::failure);
+  PQXX_CHECK_THROWS(std::ignore = t.unesc_bin("\\x0g"_zv), pqxx::failure);
+  PQXX_CHECK_THROWS(
+    std::ignore = pqxx::internal::unesc_bin("\\a"sv, pqxx::sl::current()),
+    pqxx::failure);
+  PQXX_CHECK_THROWS(
+    std::ignore = pqxx::internal::unesc_bin("\\"sv, pqxx::sl::current()),
+    pqxx::failure);
+  PQXX_CHECK_THROWS(
+    std::ignore = pqxx::internal::unesc_bin("\\\xa"sv, pqxx::sl::current()),
+    pqxx::failure);
+  PQXX_CHECK_THROWS(
+    std::ignore = pqxx::internal::unesc_bin("\\\a"sv, pqxx::sl::current()),
+    pqxx::failure);
+}
+
+
+void test_esc_like(pqxx::test::context &)
+{
+  pqxx::connection cx;
+
+  PQXX_CHECK_EQUAL(cx.esc_like<>(""), "");
+  PQXX_CHECK_EQUAL(cx.esc_like<>("abc"), "abc");
+  PQXX_CHECK_EQUAL(cx.esc_like<>("_"), "\\_");
+  PQXX_CHECK_EQUAL(cx.esc_like<>("%"), "\\%");
+  PQXX_CHECK_EQUAL(cx.esc_like<>("a%b_c"), "a\\%b\\_c");
+  PQXX_CHECK_EQUAL(cx.esc_like<'+'>("_"), "+_");
+  PQXX_CHECK_EQUAL(cx.esc_like<>("%foo"), "\\%foo");
+  PQXX_CHECK_EQUAL(cx.esc_like<>("foo%"), "foo\\%");
+  PQXX_CHECK_EQUAL(cx.esc_like<>("f%o%o"), "f\\%o\\%o");
+  PQXX_CHECK_EQUAL(cx.esc_like<>("___"), "\\_\\_\\_");
+  PQXX_CHECK_EQUAL(cx.esc_like<>("_n_n__n_"), "\\_n\\_n\\_\\_n\\_");
+  PQXX_CHECK_EQUAL(cx.esc_like<'\\'>("hello\\n"), "hello\\\\n");
+
+  // There's also the special SJIS-2004 2-byte backslash.
+  cx.set_client_encoding("SHIFT_JIS_2004");
+  PQXX_CHECK_EQUAL(cx.esc_like<>(".\x81\x5f."), ".\\\\.");
+}
+
+
+void test_escaping(pqxx::test::context &)
+{
+  pqxx::connection cx;
+  pqxx::work tx{cx};
+  test_esc(cx, tx);
+  test_quote(cx, tx);
+  test_quote_name(tx);
+  test_esc_raw_unesc_raw(tx);
+}
+
+
+void test_esc_escapes_into_buffer(pqxx::test::context &)
+{
+  pqxx::connection cx;
+  pqxx::work const tx{cx};
+
+  std::string buffer;
+  buffer.resize(20);
+
+  auto const text{"Ain't"sv};
+  auto const escaped_text{tx.esc(text, buffer)};
+  PQXX_CHECK_EQUAL(escaped_text, "Ain''t");
+
+  pqxx::bytes const data{std::byte{0x22}, std::byte{0x43}};
+  auto const escaped_data(tx.esc(data, buffer));
+  // NOLINTNEXTLINE(modernize-raw-string-literal)
+  PQXX_CHECK_EQUAL(escaped_data, "\\x2243");
+}
+
+
+void test_esc_accepts_various_types(pqxx::test::context &)
+{
+  pqxx::connection cx;
+  pqxx::work const tx{cx};
+
+  std::string buffer;
+  buffer.resize(20);
+
+  std::string const text{"it's"};
+  auto const escaped_text{tx.esc(text, buffer)};
+  PQXX_CHECK_EQUAL(escaped_text, "it''s");
+
+  std::vector<std::byte> const data{std::byte{0x23}, std::byte{0x44}};
+  auto const escaped_data(tx.esc(data, buffer));
+  PQXX_CHECK_EQUAL(escaped_data, "\\x2344");
+}
+
+
+void test_binary_esc_checks_buffer_length(pqxx::test::context &)
+{
+  pqxx::connection cx;
+  pqxx::work tx{cx};
+
+  std::string buf;
+  pqxx::bytes bin{std::byte{'b'}, std::byte{'o'}, std::byte{'o'}};
+
+  buf.resize(2 * std::size(bin) + 3);
+  std::ignore = tx.esc(bin, buf);
+  PQXX_CHECK_EQUAL(int{buf[0]}, int{'\\'});
+  PQXX_CHECK_NOT_EQUAL(int(buf[std::size(buf) - 2]), int('\0'));
+  PQXX_CHECK_EQUAL(int(buf[std::size(buf) - 1]), int('\0'));
+
+  buf.resize(2 * std::size(bin) + 2);
+  PQXX_CHECK_THROWS(std::ignore = tx.esc(bin, buf), pqxx::range_error);
+}
+
+
+void test_unesc_bin_handles_large_data(pqxx::test::context &tctx)
+{
+  pqxx::connection cx;
+  pqxx::nontransaction const tx{cx};
+
+  // Fixed test data of sufficient length that it can't be parsed in a
+  // single machine word, and preferably also not in an integral number of
+  // words.  This will tickle the hardest cases in the unescaping code.
+  constexpr auto sample_hex{
+    "\\xabcdef01234567890987654321fedcba03211919191902cdabfebfe99253a0b1"
+    "c21234567890cabdfe10101011"sv};
+  constexpr auto sample_bin{
+    "\xab\xcd\xef\x01\x23\x45\x67\x89\x09\x87\x65\x43\x21\xfe\xdc\xba\x03\x21"
+    "\x19\x19\x19\x19\x02\xcd\xab\xfe\xbf\xe9\x92\x53\xa0\xb1\xc2"
+    "\x12\x34\x56\x78\x90\xca\xbd\xfe\x10\x10\x10\x11"sv};
+
+  PQXX_CHECK_EQUAL(tx.esc(pqxx::binary_cast(sample_bin)), sample_hex);
+  PQXX_CHECK_EQUAL(
+    tx.esc(tx.unesc_bin(sample_hex)), tx.esc(pqxx::binary_cast(sample_bin)));
+
+  // It also works for randomly generated binary data.
+  pqxx::bytes const random_bin{tctx.make_bytes(0, 100)};
+  PQXX_CHECK_EQUAL(tx.unesc_bin(tx.esc(random_bin)), random_bin);
+}
+
+
+/// Run `data` through `tx.unesc_bin()`, expect to fail.
+void fail_unesc(pqxx::transaction_base const &tx, std::string_view data)
+{
+  std::ignore = tx.unesc_bin(data);
+}
+
+
+void test_unesc_bin_checks_sanity(pqxx::test::context &)
+{
+  pqxx::connection cx;
+  pqxx::nontransaction tx{cx};
+
+  PQXX_CHECK(std::empty(tx.unesc_bin("\\x")));
+  PQXX_CHECK_THROWS(fail_unesc(tx, "\\y"), pqxx::conversion_error);
+  PQXX_CHECK_THROWS(fail_unesc(tx, "\\x123"), pqxx::conversion_error);
+
+  // Bad digits:
+  PQXX_CHECK_THROWS(fail_unesc(tx, "\\xabcdefg0"), pqxx::conversion_error);
+  PQXX_CHECK_THROWS(fail_unesc(tx, "\\x0\x81"), pqxx::conversion_error);
+  PQXX_CHECK_THROWS(fail_unesc(tx, "\\x0!"), pqxx::conversion_error);
+}
+
+
+PQXX_REGISTER_TEST(test_escaping);
+PQXX_REGISTER_TEST(test_esc_escapes_into_buffer);
+PQXX_REGISTER_TEST(test_esc_accepts_various_types);
+PQXX_REGISTER_TEST(test_binary_esc_checks_buffer_length);
+PQXX_REGISTER_TEST(test_esc_like);
+PQXX_REGISTER_TEST(test_unesc_bin_handles_large_data);
+PQXX_REGISTER_TEST(test_unesc_bin_checks_sanity);
+} // namespace
